@@ -298,7 +298,7 @@ prompt_yes_no CREATE_SMOKE_TEST_POD "Create a smoke-test pod that mounts the PVC
 prompt_default TEST_POD_NAME "Smoke-test pod name" "fsx-ontap-test-pod"
 
 prompt_yes_no RUN_NODE_CONNECTIVITY_TEST "Run node connectivity test to FSx before backend creation?" "true"
-prompt_yes_no ATTEMPT_OPERATOR_INSTALL "Attempt to install Trident Operator if CRD is missing?" "false"
+prompt_yes_no ATTEMPT_OPERATOR_INSTALL "Attempt to install Trident Operator if CRD is missing?" "true"
 
 OC=(oc --context="$KCTX")
 
@@ -931,27 +931,66 @@ log "Checking TridentOrchestrator CRD"
 
 if ! "${OC[@]}" get crd tridentorchestrators.trident.netapp.io >/dev/null 2>&1; then
   if [[ "$ATTEMPT_OPERATOR_INSTALL" == "true" ]]; then
-    log "Attempting to install Trident Operator from OperatorHub"
+    log "Attempting to install NetApp Trident Certified Operator from OperatorHub"
 
-    TRIDENT_PKG="$("${OC[@]}" get packagemanifests -n openshift-marketplace --no-headers 2>/dev/null \
-      | awk 'BEGIN{IGNORECASE=1} /netapp.*trident|trident.*operator|trident/ {print $1; exit}')"
+    # Always prefer the Certified Operators catalog (not Community) so we get
+    # the supported, Red Hat-certified build of the operator.
+    TRIDENT_PKG="$("${OC[@]}" get packagemanifests -n openshift-marketplace \
+      -o json 2>/dev/null \
+      | jq -r '.items[]
+               | select(.status.catalogSource=="certified-operators")
+               | select(.metadata.name | test("trident";"i"))
+               | .metadata.name' \
+      | head -1)"
 
-    [[ -n "$TRIDENT_PKG" ]] || die "Could not find Trident Operator package in OperatorHub."
+    # Fall back to any catalog if certified-operators doesn't have it
+    if [[ -z "$TRIDENT_PKG" ]]; then
+      warn "trident-operator not found in certified-operators; falling back to any catalog."
+      TRIDENT_PKG="$("${OC[@]}" get packagemanifests -n openshift-marketplace \
+        -o json 2>/dev/null \
+        | jq -r '.items[]
+                 | select(.metadata.name | test("trident";"i"))
+                 | .metadata.name' \
+        | head -1)"
+    fi
+
+    [[ -n "$TRIDENT_PKG" ]] || die "Could not find Trident Operator package in OperatorHub. Is the cluster connected to Red Hat Marketplace / OperatorHub?"
 
     TRIDENT_CHANNEL="$("${OC[@]}" get packagemanifest "$TRIDENT_PKG" -n openshift-marketplace \
-      -o jsonpath='{.status.defaultChannel}')"
+      -o jsonpath='{.status.channels[?(@.currentCSV matches ".*certified.*|.*26\\.*|.*25\\.*")].name}' 2>/dev/null \
+      || true)"
+    # If the above filter found nothing, just use the defaultChannel
+    if [[ -z "$TRIDENT_CHANNEL" ]]; then
+      TRIDENT_CHANNEL="$("${OC[@]}" get packagemanifest "$TRIDENT_PKG" -n openshift-marketplace \
+        -o jsonpath='{.status.defaultChannel}')"
+    fi
 
-    TRIDENT_SOURCE="$("${OC[@]}" get packagemanifest "$TRIDENT_PKG" -n openshift-marketplace \
-      -o jsonpath='{.status.catalogSource}')"
+    TRIDENT_SOURCE="certified-operators"
+    TRIDENT_SOURCE_NS="openshift-marketplace"
 
-    TRIDENT_SOURCE_NS="$("${OC[@]}" get packagemanifest "$TRIDENT_PKG" -n openshift-marketplace \
-      -o jsonpath='{.status.catalogSourceNamespace}')"
-
-    echo "Package: $TRIDENT_PKG"
-    echo "Channel: $TRIDENT_CHANNEL"
-    echo "Source: $TRIDENT_SOURCE"
+    echo "Package:          $TRIDENT_PKG"
+    echo "Channel:          $TRIDENT_CHANNEL"
+    echo "Source:           $TRIDENT_SOURCE"
     echo "Source namespace: $TRIDENT_SOURCE_NS"
 
+    # OLM requires an OperatorGroup in the target namespace.
+    # openshift-operators ships with a global one on most ROSA clusters, but
+    # we create one idempotently here for fresh or non-standard clusters.
+    log "Ensuring OperatorGroup exists in $TRIDENT_OPERATOR_NS"
+    if ! "${OC[@]}" get operatorgroup -n "$TRIDENT_OPERATOR_NS" --no-headers 2>/dev/null | grep -q .; then
+      "${OC[@]}" apply -f - <<EOF
+apiVersion: operators.coreos.com/v1
+kind: OperatorGroup
+metadata:
+  name: ${TRIDENT_OPERATOR_NS}-og
+  namespace: $TRIDENT_OPERATOR_NS
+spec: {}
+EOF
+    else
+      echo "OperatorGroup already present in $TRIDENT_OPERATOR_NS — skipping."
+    fi
+
+    log "Creating Subscription for $TRIDENT_PKG"
     "${OC[@]}" apply -f - <<EOF
 apiVersion: operators.coreos.com/v1alpha1
 kind: Subscription
@@ -966,18 +1005,38 @@ spec:
   sourceNamespace: $TRIDENT_SOURCE_NS
 EOF
 
-    echo "Waiting for TridentOrchestrator CRD..."
+    log "Waiting for TridentOrchestrator CRD to appear (up to 7.5 min)..."
+    CRD_FOUND="false"
     for i in {1..90}; do
       if "${OC[@]}" get crd tridentorchestrators.trident.netapp.io >/dev/null 2>&1; then
+        CRD_FOUND="true"
+        echo "TridentOrchestrator CRD is present."
         break
       fi
+      echo "Attempt $i/90 — CRD not yet available, waiting 5 s..."
       sleep 5
     done
+
+    if [[ "$CRD_FOUND" != "true" ]]; then
+      echo
+      echo "Subscription status:"
+      "${OC[@]}" get subscription "$TRIDENT_PKG" -n "$TRIDENT_OPERATOR_NS" -o yaml 2>/dev/null || true
+      echo
+      echo "InstallPlan(s):"
+      "${OC[@]}" get installplan -n "$TRIDENT_OPERATOR_NS" 2>/dev/null || true
+      echo
+      echo "CSV(s) in $TRIDENT_OPERATOR_NS:"
+      "${OC[@]}" get csv -n "$TRIDENT_OPERATOR_NS" 2>/dev/null || true
+      die "Timed out waiting for Trident CRD after Subscription was created. Check the output above."
+    fi
+  else
+    die "Trident Operator/CRD not found. Either install the NetApp Trident Certified Operator manually into $TRIDENT_OPERATOR_NS and rerun, or answer 'yes' to 'Attempt to install Trident Operator if CRD is missing?' at the next run."
   fi
 fi
 
+# Final guard — passes immediately if the operator was already installed.
 "${OC[@]}" get crd tridentorchestrators.trident.netapp.io >/dev/null 2>&1 \
-  || die "Trident Operator/CRD not found. Install NetApp Trident Operator into $TRIDENT_OPERATOR_NS, then rerun."
+  || die "Trident Operator/CRD still not found after install attempt. See diagnostics above."
 
 ###############################################################################
 # TridentOrchestrator
