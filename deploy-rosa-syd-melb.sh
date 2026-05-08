@@ -3,7 +3,13 @@ set -euo pipefail
 
 # Enable the Region ap-southeast-4
 # aws account enable-region --region-name ap-southeast-4
-
+#
+# aws ec2 describe-availability-zones \
+#  --region ap-southeast-4 \
+#  --filters Name=state,Values=available \
+#  --query 'AvailabilityZones[*].[ZoneName,ZoneId,State]' \
+#  --output table
+#
 ########################################
 # User-configurable values
 ########################################
@@ -13,7 +19,7 @@ COMPUTE_MACHINE_TYPE="${COMPUTE_MACHINE_TYPE:-m5.xlarge}"
 REPLICAS="${REPLICAS:-3}"
 EC2_METADATA_HTTP_TOKENS="${EC2_METADATA_HTTP_TOKENS:-optional}"
 
-SYD_CLUSTER_NAME="${SYD_CLUSTER_NAME:-rosa-syd}"
+SYD_CLUSTER_NAME="${SYD_CLUSTER_NAME:-rosa-syd-2}"
 SYD_REGION="${SYD_REGION:-ap-southeast-2}"
 SYD_VPC_CIDR="${SYD_VPC_CIDR:-10.0.0.0/16}"
 SYD_MACHINE_CIDR="${SYD_MACHINE_CIDR:-10.0.0.0/16}"
@@ -21,7 +27,7 @@ SYD_SERVICE_CIDR="${SYD_SERVICE_CIDR:-172.30.0.0/16}"
 SYD_POD_CIDR="${SYD_POD_CIDR:-10.128.0.0/14}"
 SYD_HOST_PREFIX="${SYD_HOST_PREFIX:-23}"
 
-MEL_CLUSTER_NAME="${MEL_CLUSTER_NAME:-rosa-melb}"
+MEL_CLUSTER_NAME="${MEL_CLUSTER_NAME:-rosa-melb-2}"
 MEL_REGION="${MEL_REGION:-ap-southeast-4}"
 MEL_VPC_CIDR="${MEL_VPC_CIDR:-10.1.0.0/16}"
 MEL_MACHINE_CIDR="${MEL_MACHINE_CIDR:-10.1.0.0/16}"
